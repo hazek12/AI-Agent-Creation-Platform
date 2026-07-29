@@ -1,0 +1,87 @@
+import os
+from datetime import timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from cognitrix.common.constants import JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+from cognitrix.common.security import Token, authenticate, create_access_token, get_current_user
+from cognitrix.common.utils import Utils
+from cognitrix.models import User
+
+auth_api = APIRouter(
+    prefix='/auth'
+)
+
+# Secret key for JWT encoding/decoding
+
+
+class LoginForm(BaseModel):
+    username: str
+    password: str
+
+
+@auth_api.post("/login", response_model=Token)
+async def login(form_data: LoginForm):
+    user = await authenticate(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=float(JWT_ACCESS_TOKEN_EXPIRE_MINUTES))
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+
+    user_data = user.json()
+    # Never return the password hash to the client.
+    if isinstance(user_data, dict):
+        user_data.pop('password', None)
+
+    return JSONResponse({"user": user_data, "access_token": access_token, "token_type": "bearer"})
+
+@auth_api.post("/signup")
+async def signup(new_user: User):
+    # Operators can close open registration in shared/production deployments.
+    # Defaults to enabled so single-user local setups are unaffected.
+    if os.getenv('COGNITRIX_ALLOW_SIGNUP', 'true').strip().lower() not in ('1', 'true', 'yes'):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Open registration is disabled"
+        )
+    if not Utils.email_is_valid(new_user.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email address"
+        )
+    if not new_user.password or len(new_user.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters"
+        )
+
+    existing_user = await User.find_one({'email': new_user.email})
+
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered"
+        )
+    hashed_password = Utils.hash_password(new_user.password)
+    new_user.password = hashed_password
+
+    await new_user.save()
+    return {"message": "User created successfully"}
+
+@auth_api.get("/user")
+async def get_user(user: Annotated[User, Depends(get_current_user)]):
+    return user
+
+@auth_api.post("/logout")
+async def logout(current_user: User = Depends(get_current_user)):
+    # In a real application, you might want to invalidate the token here
+    return {"message": "Logged out successfully"}

@@ -1,0 +1,336 @@
+import base64
+import io
+import json
+import re
+import weakref
+import xml.etree.ElementTree as ET
+
+from bs4 import BeautifulSoup, Tag
+from PIL import Image
+
+from cognitrix.models.tool import Tool
+
+json_return_format: str = """
+Your response should be in a valid json format which can
+be directly converted into a python dictionary with
+json.loads()
+Return the response in the following format only:
+{
+"observation": "Observations made by the ai agent"
+"thought": "Thoughts of the ai agent on a task. Should include steps for completing the task.",
+"type": "result",
+"result": "<your final answer>"
+}
+
+Use the model's native tool-calling when you need to invoke tools; do not embed tool_calls in JSON.
+Do not include the json decorator in the response.
+"""
+
+xml_return_format: str = """
+    <observation>[Description of the user's request or the current situation]</observation>
+    <mindspace>
+        [Multi-dimensional representations of the problem, each on a new line]
+    </mindspace>
+    <thought>[Step-by-step reasoning process, with each step on a new line]</thought>
+    <type>result</type>
+    <result>[The result, if applicable]</result>
+    <artifacts>
+        <artifact>
+            <identifier>[Unique identifier for the artifact]</identifier>
+            <type>[MIME type of the artifact content]</type>
+            <title>[Brief title or description of the content]</title>
+            <content>[The actual content of the artifact]</content>
+        </artifact>
+        <!-- Repeat <artifact> element for multiple artifacts -->
+    </artifacts>
+```
+"""
+
+# Cache of encoded screenshots. The same PIL image lives in chat history across
+# turns, so re-encoding it on every prompt build was pure waste. Keyed by id()
+# (PIL images aren't hashable, so a WeakKeyDictionary won't work), but a
+# weakref.finalize callback removes the entry the instant the image is GC'd —
+# so a reused id() can never return a stale image.
+# ponytail: assumes images are not mutated in place after capture.
+_IMAGE_B64_CACHE: dict[int, str] = {}
+
+
+def image_to_base64(image: Image.Image) -> str:
+    """Converts a PIL Image to base64 (JPEG), cached for the image's lifetime."""
+    key = id(image)
+    cached = _IMAGE_B64_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    screenshot_bytes = io.BytesIO()
+    image.save(screenshot_bytes, format='JPEG')
+    encoded = base64.b64encode(screenshot_bytes.getvalue()).decode('utf-8')
+
+    _IMAGE_B64_CACHE[key] = encoded
+    try:
+        # Evict on GC so the id() key can't be reused under a stale entry.
+        weakref.finalize(image, _IMAGE_B64_CACHE.pop, key, None)
+    except TypeError:
+        # Non-weakref-able image: don't risk a stale entry, drop it now.
+        _IMAGE_B64_CACHE.pop(key, None)
+    return encoded
+
+
+def file_to_image_data_uri(path: str) -> str:
+    """Read an image file from disk and return a base64 `data:` URI for vision input.
+
+    Used for user-uploaded images (kept on disk, encoded at send-time) — mirrors the
+    OpenAI image_url shape the multimodal formatter emits. MIME is sniffed from the
+    actual bytes (client downscaling may re-encode to JPEG under an unchanged name),
+    falling back to the extension, then PNG.
+    """
+    mime = None
+    try:
+        with Image.open(path) as im:
+            fmt = (im.format or '').lower()
+        if fmt:
+            mime = 'image/jpeg' if fmt in ('jpg', 'jpeg') else f'image/{fmt}'
+    except Exception:
+        pass
+    if not mime:
+        import mimetypes
+        guessed, _ = mimetypes.guess_type(path)
+        mime = guessed if guessed and guessed.startswith('image/') else 'image/png'
+    with open(path, 'rb') as f:
+        encoded = base64.b64encode(f.read()).decode('utf-8')
+    return f'data:{mime};base64,{encoded}'
+
+def tool_to_functions(tool: Tool) -> dict:
+    """
+    Converts an instance of the Tool class to a JSON string in the OpenAI API format.
+
+    Args:
+        tool (Tool): An instance of the Tool class.
+
+    Returns:
+        str: A JSON string representing the tool in the OpenAI API format.
+    """
+    # Add parameters and required fields from the tool's run() method signature
+    import inspect
+
+    tool_json = {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    }
+
+    run_signature = inspect.signature(tool.run)
+    for param_name, param in run_signature.parameters.items():
+        if param.default is param.empty:
+            tool_json["function"]["parameters"]["required"].append(param_name)
+        param_type = str(param.annotation) if param.annotation != param.empty else "string"
+        tool_json["function"]["parameters"]["properties"][param_name] = {
+            "type": param_type,
+            "description": param_name
+        }
+        if param_type == "str" and hasattr(param.annotation, "__args__"):
+            tool_json["function"]["parameters"]["properties"][param_name]["enum"] = list(param.annotation.__args__)
+
+    return tool_json
+
+def extract_json(content: str) -> dict | str:
+        """
+        Extract JSON content from a response string.
+
+        Args:
+            content (str): The response string to extract JSON from.
+
+        Returns:
+            dict|str: Result of the extraction.
+        """
+        # print(rf"{content}")
+        default_content = content
+
+        if '{' not in content:
+            return content
+        try:
+            start_index = content.find('{')
+            end_index = content.rfind('}') + 1
+            # Extract the JSON string
+            content = content[start_index:end_index]
+            return json.loads(content)
+        except Exception:
+            # logging.exception(e)
+            return default_content
+
+def extract_parts(text):
+    pattern = r'(.*?)<response>(.*?)(.*)'
+
+    match = re.search(pattern, text, re.DOTALL)
+
+    if match:
+        before = match.group(1).strip()
+        response = match.group(2).strip()
+        after = match.group(3).strip()
+        return before, response, after
+    else:
+        return None, None, None
+
+def xml_to_dict(xml_string) -> dict | str:
+    """
+    Convert an XML string to a Python dictionary.
+
+    Args:
+        xml_string (str): The XML string to convert.
+
+    Returns:
+        dict: A dictionary representation of the XML string.
+
+    Raises:
+        None
+
+    This function removes the ```xml and ``` decorators from the XML string if present. It then strips any leading or trailing whitespace from the XML string. The function uses the `xml.etree.ElementTree` module to parse the XML string into an `Element` object. The `parse_element` function is defined to recursively parse the XML tree and convert it into a dictionary representation. The function returns a dictionary with the root tag as the key and the parsed XML tree as the value.
+
+    Example:
+    xml_string = '<root><child>Hello</child></root>'
+    xml_to_dict(xml_string)
+    {'root': {'child': 'Hello'}}
+    """
+    try:
+        before, extracted, after = extract_parts(xml_string)
+
+        if extracted:
+            xml_string = extracted
+
+        xml_string = xml_string.strip()
+        if xml_string.startswith("```xml"):
+            xml_string = xml_string[6:]
+        if xml_string.endswith("```"):
+            xml_string = xml_string[:-3]
+
+        xml_string = f"<response>{xml_string.strip()}</response>"
+
+        root = ET.fromstring(xml_string)
+
+        def parse_element(element):
+            result = {}
+            if element.text and element.text.strip():
+                return element.text.strip()
+
+            for child in element:
+                child_data = parse_element(child)
+                if child.tag in result:
+                    if isinstance(result[child.tag], list):
+                        result[child.tag].append(child_data)
+                    else:
+                        result[child.tag] = [result[child.tag], child_data]
+                else:
+                    result[child.tag] = child_data
+
+            if element.tag.lower() == 'response':
+                result['before'] = before
+                result['after'] = after
+
+            return result
+
+        return {root.tag: parse_element(root)}
+    except Exception:
+        # logging.exception(e)
+        return xml_string
+
+def item_to_xml(item):
+    elem = ET.Element('tool')
+    name = ET.Element('name')
+    name.text = str(item.tool_name)
+    value = ET.Element('result')
+    value.text = str(item.content)
+    elem.append(name)
+    elem.append(value)
+
+    return elem
+
+def parse_tool_call_results(lst):
+    root = ET.Element('tool_call_results')
+    for item in lst:
+        root.append(item_to_xml(item))
+    return ET.tostring(root, encoding='unicode', method='xml')
+
+def extract_tool_calls(data):
+    tool_calls = []
+    sections = data.split('<type>tool_call</type>')
+    # Skip the first element if empty
+    for section in sections[1:]:
+        soup_section = BeautifulSoup('<type>tool_call</type>' + section, 'html.parser')
+        name_tag = soup_section.find('name')
+        name = name_tag.get_text(strip=True) if name_tag else ''
+
+        arguments_tag = soup_section.find('arguments')
+        arguments = {}
+        if arguments_tag:
+            for child in arguments_tag.children: # type: ignore
+                if isinstance(child, Tag):
+                    tag_name = child.name
+                    # Get all contents of the tag as a string, including nested tags
+                    tag_content = ''.join(str(c) for c in child.contents)
+                    arguments[tag_name] = tag_content.strip()
+
+        tool_calls.append({
+            'type': 'tool_call',
+            'name': name,
+            'arguments': arguments
+        })
+    return tool_calls
+
+def extract_sections(data):
+    section_types = ['observation', 'thought', 'mindspace', 'reflection', 'text', 'artifact']
+    soup = BeautifulSoup(data, 'html.parser')
+    sections = []
+
+    # Function to convert a tag and its children to a dictionary
+    def tag_to_dict(tag):
+        content_dict = {}
+        for child in tag.children:
+            if child.name:
+                if child.name in content_dict:
+                    # If the tag appears multiple times, store as a list
+                    if isinstance(content_dict[child.name], list):
+                        content_dict[child.name].append(child.get_text(strip=True))
+                    else:
+                        content_dict[child.name] = [content_dict[child.name], child.get_text(strip=True)]
+                else:
+                    content_dict[child.name] = child.get_text(strip=True)
+            else:
+                # Add text content directly
+                content = child.strip()
+                if content:
+                    content_dict = content
+        return content_dict
+
+    # Initialize result section
+    result_content = []
+
+    # Iterate through all root-level children
+    for child in soup.children:
+        if child.name in section_types: # type: ignore
+            # Extract section type content
+            content = tag_to_dict(child)
+            sections.append({
+                'type': child.name, # type: ignore
+                child.name: content # type: ignore
+            })
+        elif isinstance(child, str):
+            # Collect text outside of section types
+            stripped_text = child.strip()
+            if stripped_text:
+                result_content.append(stripped_text)
+
+    # Add result section if there is any collected text
+    if result_content:
+        sections.append({
+            'type': 'text',
+            'text': ' '.join(result_content)
+        })
+
+    return sections
